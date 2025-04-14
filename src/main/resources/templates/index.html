@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Company Search</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .search-container {
+            margin-top: 50px;
+        }
+        #results {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="row justify-content-md-center">
+        <div class="col-md-6 search-container">
+            <h1 class="text-center">Search for Company Data</h1>
+            <form id="searchForm">
+                <div class="form-group">
+                    <input type="text" class="form-control" placeholder="Enter company ticker..." name="search">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Search</button>
+            </form>
+        </div>
+    </div>
+    <div class="row justify-content-md-center">
+        <div class="col-md-6" id="results">
+            <!-- Results will be displayed here -->
+        </div>
+    </div>
+</div>
+
+<!-- Include jQuery -->
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<!-- Bootstrap Bundle with Popper -->
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
+<!-- Your custom script (Ensure this path is correct) -->
+<script src="/js/search.js"></script>
+
+</body>
+</html>

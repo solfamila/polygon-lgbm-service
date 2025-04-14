@@ -1,0 +1,76 @@
+# You can delete this line, it's obsolete:
+# version: '3.8'
+
+services: # TOP LEVEL key
+  ticker-service: # Indented (e.g., 2 spaces) under services
+    # ...ticker-service config...
+    # (make sure you REMOVED build: . and added image: polygon-ticker-service:0.0.1-SNAPSHOT)
+    image: polygon-ticker-service:0.0.1-SNAPSHOT # Should be using the built image now
+    container_name: polygon_ticker_service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - POLYGON_API_KEY=a5etjp2CyNlCcop5tw2GMyo40HKRnJYH #<--- IMPORTANT: Don't share real keys publicly! Consider revoking if real.
+      # --- Polygon Tickers ---
+      - POLYGON_TICKERS=TSLA # Or your desired list
+
+      # --- Database Connection Details (Provided to the app) ---
+      - TIMESCALEDB_HOST=timescaledb
+      - TIMESCALEDB_PORT=5432
+      - TIMESCALEDB_USER=polygonuser
+      - TIMESCALEDB_PASS=polygonpass
+      - TIMESCALEDB_DB=polygondata
+
+      # --- Explicit Spring Boot DataSource Configuration (NEW) ---
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://timescaledb:5432/polygondata
+      - SPRING_DATASOURCE_USERNAME=polygonuser # Redundant but explicit
+      - SPRING_DATASOURCE_PASSWORD=polygonpass # Redundant but explicit
+      - SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.postgresql.Driver # Tell Spring to use PostgreSQL driver
+      - SPRING_JPA_DATABASE-PLATFORM=org.hibernate.dialect.PostgreSQLDialect # Tell Hibernate how to talk to PostgreSQL
+      - SPRING_JPA_HIBERNATE_DDL_AUTO=update # Tell Hibernate to create/update tables
+
+    depends_on:
+      - timescaledb
+    networks:
+      - polygon-net
+
+  timescaledb: # Indented (e.g., 2 spaces) under services
+    image: timescale/timescaledb-ha:pg16-ts2.14
+    container_name: polygon_timescaledb
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=polygonuser
+      - POSTGRES_PASSWORD=polygonpass
+      - POSTGRES_DB=polygondata
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    networks:
+      - polygon-net
+
+  # grafana MUST be indented to match ticker-service and timescaledb
+  grafana: # Indented (e.g., 2 spaces) under services
+    image: grafana/grafana-oss:latest
+    container_name: polygon_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - timescaledb
+    networks:
+      - polygon-net
+
+networks: # Back to TOP LEVEL
+  polygon-net:
+    driver: bridge
+
+volumes: # Back to TOP LEVEL
+  timescaledb-data:
+  grafana-data:

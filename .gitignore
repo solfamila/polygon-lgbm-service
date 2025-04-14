@@ -1,0 +1,117 @@
+HELP.md
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+.env
+
+venv/
+.env
+*.pyc
+__pycache__/
+*.joblib
+*.keras
+*.png
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*__pycache__* # Alternate cache naming
+
+# Virtual environment
+venv/
+/venv/ # Explicitly ignore top-level venv
+
+# Build Artifacts
+build/
+.gradle/
+target/ # If using Maven/other build tools later
+
+# Distribution / Packaging
+*.egg-info/
+dist/
+*.tar.gz
+*.whl
+*.zip
+
+# Databases (Keep data out of Git)
+*.db
+*.sqlite3
+*.sqlite
+
+# Secrets (CRITICAL!)
+.env 
+*.env.* # Handles .env.local, .env.development etc. but NOT .env.example
+
+# Logs and Temporary Files
+*.log
+*.tmp
+*.swp
+
+# Data Files (Often large)
+*.csv
+*.parquet
+*.hdf5
+*.h5 
+
+# Saved Models (Can be large)
+*.joblib
+*.keras
+*.onnx
+*.pb
+*.pt
+saved_model/
+*/saved_model.pb
+
+# Generated Plots/Output
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# IDE specific
+.idea/
+.vscode/
+*.iml
+*.project
+*.classpath
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
