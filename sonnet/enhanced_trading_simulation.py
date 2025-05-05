@@ -13,6 +13,12 @@ from tqdm import tqdm
 import time
 import warnings
 import seaborn as sns
+
+# Add these imports at the top of the file
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+import lightgbm as lgb
+
 warnings.filterwarnings('ignore')
 
 # Add this function near the top of your file with other utility functions
@@ -35,6 +41,447 @@ def prepare_dataframe_for_excel(df):
         
     return df_excel
 
+def fetch_historical_training_data(ticker, months=3):
+    """
+    Fetch X months of historical minute data for training purposes
+    """
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=30*months)
+    
+    # Format dates for the query
+    start_date_str = start_date.strftime('%Y-%m-%d')
+    end_date_str = end_date.strftime('%Y-%m-%d')
+    
+    print(f"Fetching {months} months of data for {ticker} ({start_date_str} to {end_date_str})...")
+    
+    query = """
+    SELECT start_time AS time, agg_open AS open, agg_high AS high, 
+           agg_low AS low, agg_close AS close, volume, vwap
+    FROM stock_aggregates_min
+    WHERE symbol = %(ticker)s AND start_time BETWEEN %(start)s AND %(end)s
+    ORDER BY start_time ASC;
+    """
+    
+    try:
+        df = pd.read_sql(query, conn, params={
+            'ticker': ticker, 
+            'start': start_date,
+            'end': end_date
+        }, parse_dates=['time'])
+        
+        if df.empty:
+            print(f"No data found for {ticker} in the specified date range.")
+            return None
+            
+        # Check for and handle duplicates
+        if df.duplicated(subset=['time']).any():
+            print(f"Warning: Duplicate timestamps found in data for {ticker}.")
+            df = df.drop_duplicates(subset=['time'], keep='first')
+            
+        df.set_index('time', inplace=True)
+        print(f"Successfully fetched {len(df)} data points.")
+        return df
+        
+    except Exception as e:
+        print(f"Error fetching historical data: {e}")
+        return None
+
+def create_training_targets(df, lookahead_period=15, target_gain=1.0):
+    """
+    Create binary target labels from historical data
+    based on price movements after lookahead_period
+    """
+    df_with_target = df.copy()
+    
+    # Calculate future returns for the lookahead period
+    future_returns = df['close'].pct_change(periods=lookahead_period).shift(-lookahead_period) * 100
+    
+    # Create binary targets
+    binary_target = (future_returns >= target_gain).astype(int)
+    
+    df_with_target['target'] = binary_target
+    
+    # Remove rows where we don't have targets (at the end of the dataframe)
+    df_with_target = df_with_target.dropna(subset=['target'])
+    
+    # Show class distribution
+    target_distribution = df_with_target['target'].value_counts(normalize=True) * 100
+    print(f"Target distribution: {target_gain}% gain opportunities: {target_distribution[1]:.2f}%")
+    
+    return df_with_target
+
+
+def train_model_on_historical_data(ticker, months=3, lookahead_period=15, target_gain=1.0):
+    """
+    Complete pipeline to train a new model on recent historical data
+    """
+    # 1. Fetch historical data
+    historical_data = fetch_historical_training_data(ticker, months)
+    if historical_data is None or historical_data.empty:
+        return None
+    
+    # 2. Generate features
+    print("Generating features...")
+    feature_df = create_features(historical_data)
+    
+    # 3. Create target labels
+    print("Creating target labels...")
+    labeled_df = create_training_targets(feature_df, lookahead_period, target_gain)
+    
+    # 4. Prepare training data
+    print("Preparing training data...")
+    X = labeled_df.drop(['target', 'open', 'high', 'low', 'close', 'volume', 'vwap'], axis=1)
+    y = labeled_df['target']
+    
+    # Check for NaNs and handle them
+    nan_columns = X.columns[X.isna().any()].tolist()
+    if nan_columns:
+        print(f"Warning: NaN values found in columns: {nan_columns}")
+        X = X.fillna(0)
+    
+    # 5. Train-test split (time-based)
+    train_size = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
+    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+    
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+    
+    # 6. Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 7. Calculate class weights
+    if (y_train == 1).sum() > 0:
+        scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+    else:
+        scale_pos_weight = 1.0
+    
+    print(f"Using scale_pos_weight: {scale_pos_weight:.2f}")
+    
+    # 8. Train LightGBM model
+    print("Training new LightGBM model...")
+    model = lgb.LGBMClassifier(
+        objective='binary',
+        metric='binary_logloss',
+        n_estimators=1000,
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        min_child_samples=20,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    # Early stopping callback
+    callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=True)]
+    
+    # Fit the model
+    model.fit(
+        X_train_scaled, y_train,
+        eval_set=[(X_test_scaled, y_test)],
+        eval_metric='binary_logloss',
+        callbacks=callbacks
+    )
+    
+    # Add to train_model_on_historical_data function, before saving the model
+    # Check if model is producing useful predictions
+    print("Validating model prediction distribution...")
+    test_probs = model.predict_proba(X_test_scaled)[:, 1]
+    
+    if test_probs.max() < 0.1:
+        print("Warning: Model is producing very low confidence scores")
+        print(f"Max confidence: {test_probs.max():.4f}, Mean confidence: {test_probs.mean():.4f}")
+        print("Adjusting model parameters to produce more useful predictions...")
+        
+        # Train a more aggressive version with different parameters
+        model_aggressive = lgb.LGBMClassifier(
+            objective='binary',
+            metric='binary_logloss',
+            n_estimators=200,
+            learning_rate=0.1,
+            num_leaves=31,
+            max_depth=5,  # Set explicit depth
+            min_child_samples=10,  # Lower to allow more detailed patterns
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=scale_pos_weight * 0.5,  # Lower to give more weight to positives
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1
+        )
+        
+        # Fit without early stopping to ensure more iterations
+        model_aggressive.fit(X_train_scaled, y_train)
+        
+        # Check if the aggressive model produces better distributed predictions
+        aggressive_probs = model_aggressive.predict_proba(X_test_scaled)[:, 1]
+        
+        if aggressive_probs.max() > test_probs.max() * 2:
+            print("Aggressive model produces better distributed predictions")
+            print(f"New max confidence: {aggressive_probs.max():.4f}, New mean: {aggressive_probs.mean():.4f}")
+            model = model_aggressive
+    
+    # 9. Evaluate the model
+    print("Evaluating model...")
+    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+    y_pred = (y_pred_proba >= 0.5).astype(int)
+    
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    auc = roc_auc_score(y_test, y_pred_proba) if len(np.unique(y_test)) > 1 else 0
+    
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC AUC: {auc:.4f}")
+    
+    # 10. Save the model and necessary artifacts
+    print("Saving model and artifacts...")
+    model_path = f'lgbm_final_model_enhanced_{ticker.lower()}.joblib'
+    feature_columns = X.columns.tolist()
+    
+    joblib.dump((model, scaler, feature_columns), model_path)
+    print(f"Model saved to {model_path}")
+    
+    # Return the trained model and artifacts
+    return model, scaler, feature_columns
+
+
+def learn_from_past_trading_mistakes(ticker, months=3, iterations=3):
+    """
+    Train-Test-Learn cycle:
+    1. Train model on historical data
+    2. Backtest on out-of-sample data
+    3. Analyze mistakes and retrain
+    4. Repeat
+    """
+    print(f"Starting learning process for {ticker} with {iterations} iterations...")
+    
+    # Initial training
+    result = train_model_on_historical_data(ticker, months)
+    if result is None:
+        print(f"Could not train initial model for {ticker}. Please check if historical data is available.")
+        return None
+        
+    model, scaler, features = result
+    
+    # Iterative learning process
+    for iteration in range(1, iterations):
+        print(f"\n--- Iteration {iteration} of {iterations-1} ---")
+        
+        # 1. Backtest the model on recent data
+        historical_data = fetch_historical_training_data(ticker, months=1)  # Use 1 month for backtesting
+        if historical_data is None or historical_data.empty:
+            print(f"Warning: Could not fetch backtesting data for iteration {iteration}")
+            continue
+            
+        # 2. Generate features
+        print("Generating features for backtesting...")
+        feature_df = create_features(historical_data)
+        
+        # 3. Make predictions and find mistakes
+        print("Making predictions to identify mistakes...")
+        X_backtest = feature_df.drop(['open', 'high', 'low', 'close', 'volume', 'vwap'], axis=1)
+        
+        # Handle NaNs
+        X_backtest = X_backtest.fillna(0)
+        
+        # Make sure we only use columns the model was trained on
+        missing_cols = [col for col in features if col not in X_backtest.columns]
+        if missing_cols:
+            print(f"Warning: Missing columns in backtest data: {missing_cols}")
+            for col in missing_cols:
+                X_backtest[col] = 0  # Add missing columns with default values
+        
+        X_backtest = X_backtest[features]  # Only use features the model knows
+        
+        # Scale the data
+        X_backtest_scaled = scaler.transform(X_backtest)
+        
+        # Predict
+        y_pred_proba = model.predict_proba(X_backtest_scaled)[:, 1]
+        
+        # Create binary prediction with optimized threshold
+        threshold = 0.57  # Using the default confidence threshold from parameters
+        y_pred = (y_pred_proba >= threshold).astype(int)
+        
+        # 4. Create actual targets for comparison
+        print("Creating targets to find mistakes...")
+        future_returns = feature_df['close'].pct_change(periods=15).shift(-15) * 100
+        y_true = (future_returns >= 1.0).astype(int)
+        
+        # Remove NaNs from targets and align predictions
+        mask = ~y_true.isna()
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+        
+        # If we don't have enough data for comparison, skip this iteration
+        if len(y_true) < 100:
+            print(f"Warning: Not enough data points after removing NaNs: {len(y_true)}")
+            continue
+        
+        # 5. Find where the model made mistakes
+        print("Identifying mistake periods...")
+        mistakes = y_true != y_pred
+        mistake_days = feature_df.index[mask][mistakes].tolist()
+        
+        if not mistake_days:
+            print("No mistakes found in this iteration!")
+            continue
+            
+        print(f"Found {len(mistake_days)} periods with mistakes")
+        
+        # 6. Fetch more data around the mistakes
+        print("Fetching additional data for mistake periods...")
+        mistake_data = fetch_data_for_mistake_periods(ticker, mistake_days)
+        
+        if mistake_data is None or mistake_data.empty:
+            print(f"Warning: Could not fetch data for mistake periods in iteration {iteration}")
+            continue
+            
+        # 7. Generate features and targets for the mistake data
+        print("Generating features for mistake data...")
+        mistake_feature_df = create_features(mistake_data)
+        
+        # 8. Create targets
+        print("Creating targets for mistake data...")
+        mistake_labeled_df = create_training_targets(mistake_feature_df)
+        
+        # 9. Prepare the mistake data for training
+        print("Preparing mistake data for training...")
+        X_mistake = mistake_labeled_df.drop(['target', 'open', 'high', 'low', 'close', 'volume', 'vwap'], axis=1)
+        y_mistake = mistake_labeled_df['target']
+        
+        # Handle NaNs
+        X_mistake = X_mistake.fillna(0)
+        
+        # Ensure we have only the columns the model expects
+        for col in features:
+            if col not in X_mistake.columns:
+                X_mistake[col] = 0
+        
+        X_mistake = X_mistake[features]
+        
+        # 10. Scale the data
+        X_mistake_scaled = scaler.transform(X_mistake)
+        
+        # 11. Update the model with the mistake data
+        print("Retraining model with mistake data...")
+        # Calculate class weights for imbalanced data
+        if (y_mistake == 1).sum() > 0:
+            scale_pos_weight = (y_mistake == 0).sum() / (y_mistake == 1).sum()
+        else:
+            scale_pos_weight = 1.0
+            
+        print(f"Using scale_pos_weight for retraining: {scale_pos_weight:.2f}")
+        
+        # Update model parameters
+        model.set_params(scale_pos_weight=scale_pos_weight)
+        
+        # Retrain
+        callbacks = [lgb.early_stopping(stopping_rounds=50, verbose=True)]
+        model.fit(
+            X_mistake_scaled, y_mistake,
+            eval_set=[(X_mistake_scaled, y_mistake)],
+            eval_metric='binary_logloss',
+            callbacks=callbacks
+        )
+        
+        print(f"Model retrained in iteration {iteration}")
+    
+    print("\nIterative learning process completed.")
+    return model, scaler, features
+
+def fetch_data_for_mistake_periods(ticker, mistake_days, buffer_days=3):
+    """
+    Fetch data for periods where the model made mistakes,
+    plus a buffer of days before/after
+    """
+    all_data = []
+    
+    for day in mistake_days:
+        # Convert day to datetime if it's not already
+        if isinstance(day, str):
+            day = pd.Timestamp(day)
+        
+        # Add buffer before and after
+        start_date = day - timedelta(days=buffer_days)
+        end_date = day + timedelta(days=buffer_days)
+        
+        query = """
+        SELECT start_time AS time, agg_open AS open, agg_high AS high, 
+               agg_low AS low, agg_close AS close, volume, vwap
+        FROM stock_aggregates_min
+        WHERE symbol = %(ticker)s AND start_time BETWEEN %(start)s AND %(end)s
+        ORDER BY start_time ASC;
+        """
+        
+        try:
+            df = pd.read_sql(query, conn, params={
+                'ticker': ticker, 
+                'start': start_date,
+                'end': end_date
+            }, parse_dates=['time'])
+            
+            if not df.empty:
+                df.set_index('time', inplace=True)
+                all_data.append(df)
+        except Exception as e:
+            print(f"Error fetching data for mistake period {day}: {e}")
+            continue
+    
+    if not all_data:
+        return None
+    
+    # Combine all fetched data
+    combined_data = pd.concat(all_data)
+    
+    # Remove duplicates that might occur in overlapping periods
+    combined_data = combined_data[~combined_data.index.duplicated(keep='first')]
+    
+    # Sort by time
+    combined_data.sort_index(inplace=True)
+    
+    print(f"Collected {len(combined_data)} data points from mistake periods.")
+    return combined_data
+
+
+# Add this function near other utility functions at the top of file
+
+def get_best_model_path(ticker):
+    """
+    Gets the best available model path for a ticker.
+    Prioritizes calibrated models over standard models if they exist.
+    
+    Args:
+        ticker (str): The ticker symbol
+    
+    Returns:
+        str: Path to the best available model
+    """
+    ticker = ticker.lower()
+    calibrated_model_path = f'lgbm_calibrated_model_{ticker}.joblib'
+    standard_model_path = f'lgbm_final_model_enhanced_{ticker}.joblib'
+    
+    if os.path.exists(calibrated_model_path):
+        print(f"Using calibrated model for {ticker}")
+        return calibrated_model_path
+    elif os.path.exists(standard_model_path):
+        print(f"Using standard model for {ticker}")
+        return standard_model_path
+    else:
+        print(f"No model found for {ticker}")
+        return None
+
+
 # Load environment variables
 load_dotenv()
 DB_PASS = os.getenv("POLYGON_DB_PASSWORD", "polygonpass")
@@ -54,6 +501,9 @@ DEFAULT_PARAMS = {
     'capital': 10000.0,
     'commission_per_share': 0.005
 }
+
+# Temporarily adjust threshold for testing purposes
+DEFAULT_PARAMS['confidence_threshold'] = 0.05
 
 # Multi-symbol testing list
 TICKERS_TO_TEST = ["TSLA", "AAPL", "MSFT", "AMZN", "NVDA"]
@@ -102,11 +552,52 @@ def fetch_data(ticker, date):
     return df
 
 # Simulate trades for a single day
-def simulate_single_day(ticker, date, params=None, fetch_missing=False):
+def simulate_single_day(ticker, date, params=None, fetch_missing=False, diagnostic_mode=False, custom_model_path=None):
     if params is None:
-        params = DEFAULT_PARAMS
+        params = DEFAULT_PARAMS.copy()  # Make sure to copy
     
-    # Extract parameters
+    # Load model artifacts - allow custom model path
+    if custom_model_path and os.path.exists(custom_model_path):
+        model_path = custom_model_path
+        print(f"Using custom model: {model_path}")
+    else:
+        model_path = f'lgbm_final_model_enhanced_{ticker.lower()}.joblib'
+    
+    if not os.path.exists(model_path):
+        print(f"Warning: Model file {model_path} not found. Skipping {ticker} on {date}.")
+        return None, None, None
+    
+    try:
+        model_data = joblib.load(model_path)
+        
+        # Check if this is a calibrated model package
+        if isinstance(model_data, dict) and 'calibration_model' in model_data:
+            print(f"Using calibrated model (method: {model_data['calibration_method']}, date: {model_data['calibration_date']})")
+            model = model_data['original_model']
+            scaler = model_data['scaler']
+            features_to_use = model_data['features']
+            calibrated_model = True
+            calibration_package = model_data
+            # Use the optimal threshold if available
+            if 'optimal_threshold' in model_data:
+                calibrated_threshold = model_data['optimal_threshold']
+                print(f"Calibrated threshold available: {calibrated_threshold:.4f}")
+
+                # Allow manual override if provided in params explicitly
+                if 'confidence_threshold' not in params:
+                    params['confidence_threshold'] = calibrated_threshold
+                    print(f"Using calibrated threshold: {calibrated_threshold:.4f}")
+                else:
+                    print(f"Using manually overridden threshold: {params['confidence_threshold']:.4f}")
+        else:
+            # Standard model format (model, scaler, features)
+            model, scaler, features_to_use = model_data
+            calibrated_model = False
+    except Exception as e:
+        print(f"Error loading model for {ticker}: {e}")
+        return None, None, None
+
+    # Extract parameters AFTER model loading to use updated threshold
     confidence_threshold = params.get('confidence_threshold', 0.57)
     target_profit_pct = params.get('target_profit_pct', 0.01)
     stop_loss_pct = params.get('stop_loss_pct', 0.01)
@@ -114,17 +605,6 @@ def simulate_single_day(ticker, date, params=None, fetch_missing=False):
     initial_capital = params.get('capital', 10000.0)
     commission_per_share = params.get('commission_per_share', 0.005)
     
-    # Load model artifacts
-    model_path = f'lgbm_final_model_enhanced_{ticker.lower()}.joblib'
-    if not os.path.exists(model_path):
-        print(f"Warning: Model file {model_path} not found. Skipping {ticker} on {date}.")
-        return None, None, None
-    
-    try:
-        model, scaler, features_to_use = joblib.load(model_path)
-    except Exception as e:
-        print(f"Error loading model for {ticker}: {e}")
-        return None, None, None
 
     # Fetch the day's data
     df_raw = fetch_data(ticker, date)
@@ -187,21 +667,59 @@ def simulate_single_day(ticker, date, params=None, fetch_missing=False):
     
     # Add market regime detection
     df_features_model['regime'] = detect_market_regime(df_features_model['close'])
-    
-    # Debug code to understand feature mismatch issues
-    print(f"Model expects {len(features_to_use)} features: {features_to_use}")
-    print(f"Current dataframe has {df_features_model.shape[1]} features: {df_features_model.columns.tolist()}")
-    
-    # Scale features for prediction - only use the original features for scaling
-    features_for_scaling = df_features_model[features_to_use].copy()
-    print(f"Features for scaling: {features_for_scaling.shape[1]} features")
-    
-    df_features_scaled = scaler.transform(features_for_scaling)
-    
-    # Make predictions
-    predictions = model.predict_proba(df_features_scaled)[:, 1]  # Get probability of positive class
+
+    # After adding regime detection but before scaling
+    if 'regime' in features_to_use:
+        # Convert string regime values to numeric
+        regime_mapping = {
+            'LOW_VOL': 0,
+            'MED_VOL': 1, 
+            'HIGH_VOL': 2,
+            'UNDEFINED': -1
+        }
+        df_features_model['regime'] = df_features_model['regime'].map(regime_mapping)
+
+    # Ensure the features expected by the model exist in the dataframe
+    missing_features = [f for f in features_to_use if f not in df_features_model.columns]
+    if missing_features:
+        print(f"Error: Missing expected features in dataframe: {missing_features}")
+        # Attempt to re-generate features if missing, might indicate an issue upstream
+        # For now, return None as the state is inconsistent
+        return None, None, None
+
+    # Select only the features the model was trained on for scaling and prediction
+    # This ensures we only use the columns the model expects
+    features_for_prediction = df_features_model[features_to_use].copy()
+
+    # Updated Debug code to show alignment just before scaling
+    print(f"Model expects {len(features_to_use)} features.")
+    # This print statement now shows the columns actually being used for prediction
+    print(f"Features selected for scaling/prediction ({features_for_prediction.shape[1]}): {features_for_prediction.columns.tolist()}")
+
+    # Scale the selected features
+    df_features_scaled = scaler.transform(features_for_prediction)
+
+    # Make predictions using the scaled features
+    if calibrated_model:
+        # Import the prediction function
+        from model_calibration import predict_with_calibrated_model
+        predictions = predict_with_calibrated_model(calibration_package, df_features_scaled)
+    else:
+        predictions = model.predict_proba(df_features_scaled)[:, 1]  # Get probability of positive class
+
+    # Add predictions back to the main df for use in simulation logic
     df_features_model['predicted_probability'] = predictions
-    
+
+    # Diagnostic print statements
+    exceeding_threshold = (predictions > confidence_threshold).sum()
+    print(f"Predictions exceeding threshold ({confidence_threshold:.4f}): {exceeding_threshold}/{len(predictions)}")
+    print(f"Prediction stats - Min: {predictions.min():.4f}, Mean: {predictions.mean():.4f}, Max: {predictions.max():.4f}")
+
+    # Early return if no predictions exceed threshold
+    if exceeding_threshold == 0:
+        print("No predictions exceed the threshold - no trades will be executed.")
+        return None, None, None
+
     # Trading simulation variables
     capital = initial_capital
     shares_owned = 0
@@ -238,11 +756,12 @@ def simulate_single_day(ticker, date, params=None, fetch_missing=False):
                     continue
                 
                 # Adjust for regime - be more conservative in high volatility
-                if row['regime'] == 'LOW_VOL':
+
+                if row['regime'] == 0:  # LOW_VOL
                     position_size_factor = 1.0  # Full size in low vol
-                elif row['regime'] == 'MED_VOL':
+                elif row['regime'] == 1:  # MED_VOL
                     position_size_factor = 0.8  # 80% size in medium vol
-                else:  # HIGH_VOL
+                else:  # HIGH_VOL or UNDEFINED
                     position_size_factor = 0.5  # 50% size in high vol
                 
                 # Apply position sizing
@@ -415,6 +934,68 @@ def simulate_single_day(ticker, date, params=None, fetch_missing=False):
             'sharpe_ratio': sharpe_ratio
         }
     else:
+        # Diagnostic mode for empty trades
+        if diagnostic_mode and trades_df.empty:
+            print(f"\n--- Diagnostic Information for {ticker} on {date.date()} ---")
+            
+            # Confidence score analysis
+            confidence_scores = df_features_model['predicted_probability'].values
+            print(f"Confidence score statistics:")
+            print(f"  Mean: {confidence_scores.mean():.4f}")
+            print(f"  Max: {confidence_scores.max():.4f}")
+            print(f"  Min: {confidence_scores.min():.4f}")
+            print(f"  Values > 0.5: {(confidence_scores > 0.5).sum()} ({(confidence_scores > 0.5).sum()/len(confidence_scores)*100:.2f}%)")
+            print(f"  Values > {confidence_threshold}: {(confidence_scores > confidence_threshold).sum()} ({(confidence_scores > confidence_threshold).sum()/len(confidence_scores)*100:.2f}%)")
+            
+            # Create diagnostic visualization
+            plt.figure(figsize=(14, 10))
+            
+            # 1. Price chart
+            plt.subplot(3, 1, 1)
+            plt.plot(close_prices.index, close_prices, 'k-', label='Price')
+            plt.title(f'{ticker} Price - {date.date()}')
+            plt.ylabel('Price ($)')
+            plt.grid(True, alpha=0.3)
+            
+            # 2. Confidence scores
+            plt.subplot(3, 1, 2)
+            plt.plot(df_features_model.index, df_features_model['predicted_probability'], 'b-')
+            plt.axhline(y=confidence_threshold, color='r', linestyle='--', label=f'Threshold ({confidence_threshold})')
+            plt.axhline(y=0.5, color='g', linestyle=':', label='0.5 Level')
+            plt.title('Model Confidence Scores')
+            plt.ylabel('Confidence')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # 3. Regime analysis
+            plt.subplot(3, 1, 3)
+            regimes = df_features_model['regime'].value_counts()
+            plt.bar(regimes.index, regimes.values)
+            plt.title('Market Regime Distribution')
+            plt.ylabel('Number of Periods')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            diagnostic_filename = f"{ticker}_diagnostic_{date.date()}.png"
+            plt.savefig(diagnostic_filename)
+            plt.close()
+            print(f"Diagnostic visualization saved to {diagnostic_filename}")
+            
+            # Offer to try a lower threshold
+            try_lower = input("\nNo trades were executed. Would you like to try with a lower confidence threshold? (y/n): ").lower() == 'y'
+            if try_lower:
+                new_threshold = float(input("Enter new confidence threshold (0.5-0.57): ") or "0.52")
+                # Make sure threshold is reasonable
+                new_threshold = max(0.5, min(confidence_threshold, new_threshold))
+                print(f"Rerunning simulation with confidence threshold = {new_threshold}")
+                
+                # Create new params with lower threshold
+                new_params = params.copy()
+                new_params['confidence_threshold'] = new_threshold
+                
+                # Recursively call simulate_single_day with new threshold
+                return simulate_single_day(ticker, date, new_params, fetch_missing)
+        
         # Basic metrics if no trades were executed
         metrics = {
             'date': date.date(),
@@ -755,9 +1336,11 @@ def run_enhanced_simulation():
     print("5. Analyze trading patterns")
     print("6. Paper trading integration")
     print("7. Fetch missing data from Polygon")
+    print("8. Model improvement through historical learning")
+    print("9. Model calibration")
     
     try:
-        choice = int(input("\nEnter your choice (1-7): "))
+        choice = int(input("\nEnter your choice (1-9): "))
     except ValueError:
         choice = 1  # Default
     
@@ -772,8 +1355,20 @@ def run_enhanced_simulation():
         date_str = input("Enter date (YYYY-MM-DD) (default: 2025-05-02): ") or "2025-05-02"
         date = pd.Timestamp(date_str, tz='UTC')
         
+        # Add diagnostic mode option
+        diagnostic_mode = input("Run in diagnostic mode? (y/n): ").lower() == 'y'
+        
+        # Get the best model path (will use calibrated if available)
+        model_path = get_best_model_path(ticker)
+        
         start_time = time.time()
-        trades_df, metrics_df, viz_data = simulate_single_day(ticker, date, fetch_missing=fetch_missing)
+        trades_df, metrics_df, viz_data = simulate_single_day(
+            ticker, 
+            date, 
+            fetch_missing=fetch_missing, 
+            diagnostic_mode=diagnostic_mode,
+            custom_model_path=model_path
+        )
         print(f"Simulation completed in {time.time() - start_time:.2f} seconds")
     
     elif choice == 2:
@@ -1364,15 +1959,22 @@ def run_enhanced_simulation():
             print("No trades found for analysis")
     
     elif choice == 6:
-        # 7. Paper Trading Integration
+        # Paper Trading Integration
         ticker = input("Enter ticker (default: TSLA): ") or "TSLA"
         date_str = input("Enter date (YYYY-MM-DD) (default: 2025-05-02): ") or "2025-05-02"
         date = pd.Timestamp(date_str, tz='UTC')
         
         print(f"\nRunning simulation and integrating with paper trading for {ticker} on {date.date()}...")
         
+        # Get the best model path (will use calibrated if available)
+        model_path = get_best_model_path(ticker)
+        
         start_time = time.time()
-        trades_df, metrics_df, _ = simulate_single_day(ticker, date)
+        trades_df, metrics_df, _ = simulate_single_day(
+            ticker, 
+            date,
+            custom_model_path=model_path
+        )
         print(f"Simulation completed in {time.time() - start_time:.2f} seconds")
         
         if not trades_df.empty:
@@ -1411,8 +2013,195 @@ def run_enhanced_simulation():
         else:
             print(f"Failed to fetch data for {ticker} on {date.date()}")
     
+    elif choice == 8:
+        # Model improvement through historical learning
+        ticker = input("Enter ticker (default: TSLA): ") or "TSLA"
+        
+        # Validate ticker - ensure it's not just a number and follows stock symbol pattern
+        if ticker.isdigit() or len(ticker) < 1 or len(ticker) > 5:
+            print(f"Warning: '{ticker}' doesn't appear to be a valid stock symbol.")
+            confirm = input("Do you want to continue anyway? (y/n): ").lower()
+            if confirm != 'y':
+                print("Operation cancelled. Please try again with a valid ticker symbol.")
+                return
+        
+        months = int(input("How many months of data to use (default: 3): ") or "3")
+        iterations = int(input("Number of learning iterations (default: 3): ") or "3")
+        
+        print(f"\nStarting model improvement process for {ticker} using {months} months of data...")
+        
+        # Make sure required modules are imported
+        try:
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+            import numpy as np
+            import lightgbm as lgb
+        except ImportError as e:
+            print(f"Missing required package: {e}")
+            print("Please install required packages: pip install scikit-learn lightgbm")
+            return
+        
+        start_time = time.time()
+        
+        # Start the learning process - with improved error handling
+        try:
+            result = learn_from_past_trading_mistakes(ticker, months, iterations)
+            if result is None:
+                print(f"Could not improve model for {ticker} due to insufficient historical data.")
+                return
+            else:
+                model, scaler, features = result
+                
+                print(f"\nModel improvement process completed in {time.time() - start_time:.2f} seconds")
+                
+                # Make the improved model the default model
+                if model is not None:
+                    final_model_path = f'lgbm_final_model_enhanced_{ticker.lower()}.joblib'
+                    joblib.dump((model, scaler, features), final_model_path)
+                    print(f"Final improved model saved as the default model: {final_model_path}")
+        except Exception as e:
+            print(f"Error during model improvement process: {e}")
+            print("Please check if the ticker symbol is valid and has sufficient historical data.")
+    
+# Replace the existing choice == 9 block with:
+
+    elif choice == 9:
+        # Model Calibration
+        print("\n--- Model Calibration Tool ---")
+        print("This will calibrate your model to produce better confidence scores.")
+        ticker = input("Enter ticker (default: TSLA): ") or "TSLA"
+    
+        try:
+            # First check if model_calibration.py exists
+            if not os.path.exists("model_calibration.py"):
+                print("Error: model_calibration.py file not found.")
+                print("Creating the file now...")
+                with open("model_calibration.py", "w") as f:
+                    # Fetch template from the previous code
+                    # This is a simplified version for this demo
+                    f.write("""
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from datetime import datetime, timedelta, timezone
+import os
+from lgbm_prediction_service import create_features
+import psycopg2
+from dotenv import load_dotenv
+
+# Load environment variables for database connection
+load_dotenv()
+DB_PASS = os.getenv("POLYGON_DB_PASSWORD", "polygonpass")
+DB_HOST = "localhost"
+DB_PORT = "5433"
+DB_NAME = "polygondata"
+DB_USER = "polygonuser"
+
+def suggest_optimal_threshold(calibrated_probs):
+    \"\"\"Suggest an optimal threshold based on the distribution of calibrated probabilities\"\"\"
+    # Get distribution statistics
+    mean_prob = np.mean(calibrated_probs)
+    max_prob = np.max(calibrated_probs)
+    
+    # Find the 90th percentile as a reasonable threshold
+    p90 = np.percentile(calibrated_probs, 90)
+    
+    # Suggest a threshold slightly below the 90th percentile
+    # but not less than half the maximum probability
+    suggested = min(p90, max(max_prob * 0.5, mean_prob * 2))
+    
+    print(f"Suggested threshold for calibrated model: {suggested:.4f}")
+    print(f"This would activate on approximately 10% of predictions")
+    
+    return suggested
+
+# Other functions from the complete model_calibration.py file...
+                """)
+                print("Created a simple model_calibration.py template. You will need to complete it with all functions.")
+            
+            # Import the model_calibration module
+            import model_calibration
+        
+            method = input("Calibration method (isotonic/platt) default: isotonic: ") or "isotonic"
+            result = model_calibration.calibrate_model(ticker, method)
+        
+            if result:
+                print("\nModel calibration successful!")
+                use_now = input("Use calibrated model for a simulation now? (y/n): ").lower() == 'y'
+                if use_now:
+                    date_str = input("Enter date (YYYY-MM-DD) (default: 2025-05-02): ") or "2025-05-02"
+                    date = pd.Timestamp(date_str, tz='UTC')
+                
+                    # Specify the calibrated model path
+                    calibrated_model_path = f'lgbm_calibrated_model_{ticker.lower()}.joblib'
+                
+                    # First run diagnostic mode to get probability distribution
+                    print("Running diagnostic to determine optimal threshold...")
+                    cal_params = DEFAULT_PARAMS.copy()
+                
+                    # Load the calibrated model to analyze its probabilities
+                    calibration_package = joblib.load(calibrated_model_path)
+                
+                    # Run an initial simulation to get the probability distribution
+                    df_raw = fetch_data(ticker, date)
+                    if not df_raw.empty:
+                        # Generate features
+                        df_features = create_features(df_raw.copy())
+                    
+                        # Create a copy for model features
+                        df_features_model = df_features.copy()
+                        df_features_model = df_features_model.dropna()
+                    
+                        # Get features for prediction
+                        features_to_use = calibration_package['features']
+                        features_for_prediction = df_features_model[features_to_use].copy()
+                    
+                        # Scale features
+                        scaler = calibration_package['scaler']
+                        df_features_scaled = scaler.transform(features_for_prediction)
+                    
+                        # Get predictions
+                        from model_calibration import predict_with_calibrated_model
+                        predictions = predict_with_calibrated_model(calibration_package, df_features_scaled)
+                    
+                        # Determine optimal threshold
+                        if hasattr(model_calibration, 'suggest_optimal_threshold'):
+                            optimal_threshold = model_calibration.suggest_optimal_threshold(predictions)
+                        else:
+                            # Fallback to a simple percentile if the function doesn't exist
+                            optimal_threshold = np.percentile(predictions, 90)
+                            print(f"Using 90th percentile as threshold: {optimal_threshold:.4f}")
+                    
+                        # Update parameters with optimal threshold
+                        cal_params['confidence_threshold'] = optimal_threshold
+                    else:
+                        # Fallback if we can't get predictions
+                        cal_params['confidence_threshold'] = 0.05
+                        print(f"No data available for {ticker} on {date}. Using fallback threshold: {cal_params['confidence_threshold']}")
+                
+                    # Now run the actual simulation with the optimal threshold
+                    start_time = time.time()
+                    print(f"Running simulation with calibrated model and threshold {cal_params['confidence_threshold']:.4f}...")
+                    trades_df, metrics_df, viz_data = simulate_single_day(
+                        ticker, 
+                        date, 
+                        params=cal_params,
+                        diagnostic_mode=False,
+                        custom_model_path=calibrated_model_path
+                    )
+                    print(f"Simulation completed in {time.time() - start_time:.2f} seconds")
+            else:
+                print("Model calibration failed.")
+        except Exception as e:
+            print(f"Error during model calibration: {e}")
+            import traceback
+            traceback.print_exc() 
     else:
-        print("Invalid choice. Please run again and select options 1-7.")
+        print("Invalid choice. Please run again and select options 1-9.")
     
     # Clean up
     if conn:

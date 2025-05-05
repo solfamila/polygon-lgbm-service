@@ -86,63 +86,70 @@ except Exception as e: print(f"Setup Error: {e}"); exit(1)
 # --- Enhanced Feature Engineering Function Definition ---
 def create_features(df_input): 
     print("Generating features...")
-    df = df_input.copy() # Work on internal copy
-    required_cols=['open','high','low','close','volume']; required_ta_cols=['high','low','close','volume']
-    if not all(col in df.columns for col in required_cols): print(f"Error: Feature Gen Missing required columns: {required_cols}"); return pd.DataFrame()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try: df.index = pd.to_datetime(df.index, utc=True)
-        except Exception as e: print(f"Feature Gen Error converting index: {e}"); return pd.DataFrame()
-    if not df.index.is_monotonic_increasing: print("Warning: Sorting non-monotonic index in feature gen..."); df.sort_index(inplace=True)
+    df = df_input.copy()
 
-    initial_rows = len(df)
-    
-    # 1. Basic Features
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    if not all(col in df.columns for col in required_cols):
+        print(f"Error: Missing required columns: {required_cols}")
+        return pd.DataFrame()
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df.index = pd.to_datetime(df.index, utc=True)
+        except Exception as e:
+            print(f"Feature Gen Error converting index: {e}")
+            return pd.DataFrame()
+
+    df.sort_index(inplace=True)
+
+    # Existing basic features
     df['return'] = df['close'].pct_change()
     df['high_low_range'] = df['high'] - df['low']
     df['close_open_diff'] = df['close'] - df['open']
-    df['log_volume'] = np.log1p(df['volume'].replace(0, 1)) 
-    df['price_vwap_diff'] = df['close'] - df['vwap'] if 'vwap' in df.columns else 0
-    df['price_vwap_diff'] = df['price_vwap_diff'].fillna(0) 
+    df['log_volume'] = np.log1p(df['volume'].replace(0, 1))
+    df['price_vwap_diff'] = (df['close'] - df['vwap']).fillna(0)
 
-    # 2. Moving Averages & Ratios
+    # Moving averages & ratios
     for window in [5, 10, 20, 60]:
         df[f'ma_{window}'] = df['close'].rolling(window=window, min_periods=window).mean()
         df[f'ma_vol_{window}'] = df['volume'].rolling(window=window, min_periods=window).mean()
         df[f'close_ma_{window}_ratio'] = (df['close'] / df[f'ma_{window}']).replace([np.inf, -np.inf], np.nan)
         df[f'volume_ma_{window}_ratio'] = (df['volume'] / df[f'ma_vol_{window}']).replace([np.inf, -np.inf], np.nan)
 
-    # 3. Momentum / ROC
-    for window in [1, 5, 10, 20]: df[f'roc_{window}'] = df['close'].pct_change(periods=window)
+    # --- New features to add ---
 
-    # 4. Volatility
-    df['volatility_20'] = df['return'].rolling(window=20, min_periods=20).std()
-    
-    # TA Features 
-    ta_cols_to_add = ['ATRr_14', 'BBL_20_2.0', 'BBM_20_2.0', 'BBU_20_2.0', 'BBB_20_2.0', 'BBP_20_2.0', 'RSI_14']
-    # Initialize columns correctly
-    for col in ta_cols_to_add: 
-        if col not in df.columns: df[col] = np.nan 
+    # Volatility (5-minute rolling standard deviation of returns)
+    df['volatility_5m'] = df['return'].rolling(window=5).std()
 
+    # Volume-based features
+    df['volume_ma_5'] = df['volume'].rolling(window=5).mean()
+    df['volume_change_1m'] = df['volume'].pct_change()
+
+    # Momentum indicator (RSI)
     if PANDAS_TA_AVAILABLE:
-        # print("Calculating pandas_ta features...") # Verbose optional
-        try:
-            if not all(col in df.columns for col in required_ta_cols): raise ValueError("Missing TA cols")
-            df.ta.atr(length=14, append=True); 
-            bbands_df = df.ta.bbands(length=20, std=2, append=False); 
-            if bbands_df is not None: df.update(bbands_df) # Use update
-            df.ta.rsi(length=14, append=True)
-            # print("TA features added.") # Verbose optional
-        except Exception as e: print(f"Warn: TA error: {e}")
+        df['rsi_14'] = df.ta.rsi(length=14)
+    else:
+        print("Warning: pandas_ta not installed, skipping RSI feature.")
+        df['rsi_14'] = np.nan
 
-    # 5. Volume delta
+    # Price range features
+    df['high_low_range'] = df['high'] - df['low']
+    df['close_high_ratio'] = df['close'] / df['high']
+    df['close_low_ratio'] = df['close'] / df['low']
+
+    # Trend indicator (EMA)
+    df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
+
+    # Volume delta
     df['volume_delta'] = df['volume'].pct_change().replace([np.inf, -np.inf], np.nan)
 
-    # 6. Time features
-    df['hour'] = df.index.hour; df['dayofweek'] = df.index.dayofweek
-    df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24.0); df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24.0)
-    df['day_sin'] = np.sin(2 * np.pi * df['dayofweek']/7.0); df['day_cos'] = np.cos(2 * np.pi * df['dayofweek']/7.0)
+    # Time features
+    df['hour'] = df.index.hour
+    df['dayofweek'] = df.index.dayofweek
 
-    # Return df with all columns, handle NaNs before scaling/prediction
+    # Drop rows with NaNs resulting from rolling calculations
+    df.dropna(inplace=True)
+
     print(f"Finished feature generation. Shape: {df.shape}")
     return df
 
