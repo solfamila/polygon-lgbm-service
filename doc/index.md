@@ -1,67 +1,71 @@
-# Tutorial: polygon-lgbm-service
+# Tutorial: nvda-daily-prediction
 
-This project is a system for **algorithmic trading experimentation** using stock market data.
-It starts by *ingesting real-time* stock data from Polygon.io using a Java service and storing it in a **TimescaleDB database**.
-Python scripts then use this historical data to *engineer features* (informative signals) and train **machine learning models** (like LightGBM) with walk-forward validation to predict future price movements.
-Another Python service runs continuously, using the trained model to make *live predictions* based on the latest data, saving these predictions back to the database.
-Finally, a separate Python script simulates **paper trading**, making hypothetical buy/sell decisions based on the model's predictions and tracking the simulated profit or loss.
-The entire system (database, Java service, visualization) is managed using **Docker Compose**, and configuration (like API keys) is handled through `.env` and property files.
+This project, `nvda-daily-prediction`, is designed to **predict daily stock price movements** for NVIDIA (NVDA).
+It involves several key stages: *ingesting live market data* from Polygon.io, *storing it in a TimescaleDB database*,
+*engineering relevant market features* using Python/Pandas, *training a machine learning model* (e.g., LightGBM or XGBoost)
+with walk-forward validation, making *real-time predictions* with the trained model, and then *simulating trading strategies*
+(paper trading) based on these predictions. The entire system, including the database and data ingestion service,
+is **orchestrated using Docker Compose** for easy deployment and consistent operation.
 
 
-**Source Repository:** [https://github.com/solfamila/polygon-lgbm-service](https://github.com/solfamila/polygon-lgbm-service)
+**Source Repository:** [https://github.com/solfamila/polygon-lgbm-service/tree/feature/nvda-daily-prediction](https://github.com/solfamila/polygon-lgbm-service/tree/feature/nvda-daily-prediction)
 
 ```mermaid
 flowchart TD
-    A0["Real-time Data Ingestion Service (Java)
+    A0["Dockerized Service Orchestration
 "]
-    A1["Database Schema & Persistence
+    A1["Secure Configuration & Secrets Management
 "]
-    A2["Infrastructure Orchestration (Docker Compose)
+    A2["Live Market Data Ingestion (Java/WebSocket)
 "]
-    A3["Feature Engineering (Python)
+    A3["Time-Series Data Persistence (TimescaleDB & JPA/psycopg2)
 "]
-    A4["Model Training & Walk-Forward Validation (Python)
+    A4["Market Feature Engineering (Python/Pandas)
 "]
-    A5["Prediction Service (Python)
+    A5["Predictive Model Training & Walk-Forward Validation
 "]
-    A6["Paper Trading Simulation (Python)
+    A6["Real-time Prediction Engine (Python)
 "]
-    A7["Configuration Management
+    A7["Simulated Trading Execution (Paper Trading)
 "]
-    A0 -- "Writes Real-time Data To" --> A1
-    A1 -- "Provides Raw Data To" --> A3
-    A2 -- "Runs & Configures Service" --> A0
-    A2 -- "Runs & Configures Database" --> A1
-    A3 -- "Provides Features For Training" --> A4
-    A3 -- "Provides Features For Predi..." --> A5
-    A4 -- "Produces Trained Model For" --> A5
-    A5 -- "Writes Predictions To" --> A1
-    A5 -- "Provides Predictions For" --> A6
-    A6 -- "Reads Prices & Writes Trade..." --> A1
-    A7 -- "Configures Service (API Key..." --> A0
-    A7 -- "Defines Infrastructure Stack" --> A2
-    A7 -- "Configures Data Access (DB/..." --> A4
-    A1 -- "Provides Prediction Data To" --> A6
+    A0 -- "Uses env config" --> A1
+    A0 -- "Deploys service" --> A2
+    A0 -- "Deploys database" --> A3
+    A1 -- "Configures service" --> A2
+    A1 -- "Configures DB access" --> A4
+    A1 -- "Configures DB access" --> A5
+    A1 -- "Configures DB access" --> A6
+    A1 -- "Configures DB access" --> A7
+    A2 -- "Writes market data" --> A3
+    A4 -- "Reads market data" --> A3
+    A4 -- "Provides features to" --> A5
+    A4 -- "Provides feature logic to" --> A6
+    A5 -- "Reads historical data" --> A3
+    A5 -- "Provides trained model to" --> A6
+    A6 -- "Reads market data" --> A3
+    A6 -- "Writes predictions" --> A3
+    A7 -- "Reads predictions/prices" --> A3
+    A7 -- "Writes paper trades" --> A3
 ```
 
 ## Chapters
 
-1. [Configuration Management
-](01_configuration_management_.md)
-2. [Infrastructure Orchestration (Docker Compose)
-](02_infrastructure_orchestration__docker_compose__.md)
-3. [Database Schema & Persistence
-](03_database_schema___persistence_.md)
-4. [Real-time Data Ingestion Service (Java)
-](04_real_time_data_ingestion_service__java__.md)
-5. [Feature Engineering (Python)
-](05_feature_engineering__python__.md)
-6. [Model Training & Walk-Forward Validation (Python)
-](06_model_training___walk_forward_validation__python__.md)
-7. [Prediction Service (Python)
-](07_prediction_service__python__.md)
-8. [Paper Trading Simulation (Python)
-](08_paper_trading_simulation__python__.md)
+1. [Dockerized Service Orchestration
+](01_dockerized_service_orchestration_.md)
+2. [Secure Configuration & Secrets Management
+](02_secure_configuration___secrets_management_.md)
+3. [Time-Series Data Persistence (TimescaleDB & JPA/psycopg2)
+](03_time_series_data_persistence__timescaledb___jpa_psycopg2__.md)
+4. [Live Market Data Ingestion (Java/WebSocket)
+](04_live_market_data_ingestion__java_websocket__.md)
+5. [Market Feature Engineering (Python/Pandas)
+](05_market_feature_engineering__python_pandas__.md)
+6. [Predictive Model Training & Walk-Forward Validation
+](06_predictive_model_training___walk_forward_validation_.md)
+7. [Real-time Prediction Engine (Python)
+](07_real_time_prediction_engine__python__.md)
+8. [Simulated Trading Execution (Paper Trading)
+](08_simulated_trading_execution__paper_trading__.md)
 
 
 ---
